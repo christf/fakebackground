@@ -21,7 +21,26 @@ of `/dev/nvidia0` to determine if there is a GPU present. By
 downscaling the image sent to bodypix neural network, and upscaling the
 received mask, this whole setup runs sufficiently fast under Intel i7-4900MQ.
 
+
+This software can produce a virtual background on webcams via v4l2 loopback 
+device on Linux.
+The idea and the code was borrowed from: 
+https://github.com/fangfufu/Linux-Fake-Background-Webcam
+
+Unfortunately running tensorflow on my laptop cooks the device while generating 
+2 frames per second output with a 4 second delay. Also a bit of the background 
+  was still revealed.
+It might be how I chose the parameters for bodypix but since my machine clearly 
+was not up to the task I abandoned that approach and started using a green 
+screen.
+That way my machine creates 15FPS with sub second latency, which is fast enough for video calls.
+
+
+
 ## Prerequisite
+
+A light green cloth is needed that you can hang behind you.
+
 You need to install either v4l2loopback or akvcam. This repository was
 originally written with v4l2loopback in mind. However, there has been report
 that v4l2loopback does not work with certain versions of Ubuntu. Additionally,
@@ -221,6 +240,37 @@ the performance. For me, it improved the framerate.
 
 In order to compile your own Tensorflow C library, please follow the instruction
 at [TENSORFLOW.md](TENSORFLOW.md)
+
+
+
+## Things to Do
+
+### Automatic Initialization
+
+It would be nice if the fake background detector would initialize the correct 
+color space. We could use bodypix to take a few analysis frames and then have 
+the resulting image analyzed for hsv values which then are used during the 
+run-time of the tool.
+
+It would be nice if this could be achieved without running an external node 
+application.
+
+### Remove wobbling
+
+Webcam images contain quite a bit of noise. The image processing removes the 
+background based on HSV values. While this works, the noise in the images 
+causes wobbling edges.
+
+It would be interesting to reduce that. Possibly by not calculating an entirely 
+new mask for every single frame to smoothen out the noise a bit.
+
+
+### Getting rid of the green screen
+
+Ideally we could get rid of the green screen entirely - at home it is just a 
+nuisance having to have it around.
+
+
 
 ## License
 
