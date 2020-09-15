@@ -20,8 +20,6 @@ import fnmatch
 import time
 import threading
 
-from akvcam import AkvCameraWriter
-
 def findFile(pattern, path):
     for root, _, files in os.walk(path):
         for name in files:
@@ -96,7 +94,6 @@ class FakeCam:
         foreground_mask_image: str,
         webcam_path: str,
         v4l2loopback_path: str,
-        use_akvcam: bool
     ) -> None:
         self.use_foreground = use_foreground
         self.hologram = hologram
@@ -109,11 +106,7 @@ class FakeCam:
         # In case the real webcam does not support the requested mode.
         self.width = self.real_cam.get_frame_width()
         self.height = self.real_cam.get_frame_height()
-        self.use_akvcam = use_akvcam
-        if not use_akvcam:
-            self.fake_cam = pyfakewebcam.FakeWebcam(v4l2loopback_path, self.width, self.height)
-        else:
-            self.fake_cam = AkvCameraWriter(v4l2loopback_path, self.width, self.height)
+        self.fake_cam = pyfakewebcam.FakeWebcam(v4l2loopback_path, self.width, self.height)
         self.foreground_mask = None
         self.inverted_foreground_mask = None
         self.session = requests.Session()
@@ -130,24 +123,40 @@ class FakeCam:
         self.images: Dict[str, Any] = {}
         self.image_lock = asyncio.Lock()
 
-    async def _get_mask(self, frame, session):
-        frame = cv2.resize(frame, (0, 0), fx=self.scale_factor,
-                           fy=self.scale_factor)
-        _, data = cv2.imencode(".png", frame)
-        #print("Posting to " + self.bodypix_url)
-        async with session.post(
-            url=self.bodypix_url, data=data.tostring(),
-            headers={"Content-Type": "application/octet-stream"}
-        ) as r:
-            mask = np.frombuffer(await r.read(), dtype=np.uint8)
-            mask = mask.reshape((frame.shape[0], frame.shape[1]))
-            mask = cv2.resize(
-                mask, (0, 0), fx=1 / self.scale_factor,
-                fy=1 / self.scale_factor, interpolation=cv2.INTER_NEAREST
-            )
-            mask = cv2.dilate(mask, np.ones((10, 10), np.uint8), iterations=1)
-            mask = cv2.blur(mask.astype(float), (30, 30))
-            return mask
+
+
+    async def _get_mask(self, frame):
+        def denoise(mask, val):
+            thresh = cv2.threshold(mask, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+            cnts = cv2.findContours(thresh, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+            cnts = cnts[0] if len(cnts) == 2 else cnts[1]
+            applymorphology = False
+            for c in cnts:
+                area = cv2.contourArea(c)
+                if area < 5000:
+                    applymorphology = True
+                    cv2.drawContours(thresh, [c], -1, (val,val,val), -1)
+                    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                                       (20,20))
+            return cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel,
+                                                      iterations=1) if applymorphology else mask
+        hsv = cv2.cvtColor(frame, cv2.COLOR_RGB2HSV)
+        # define range of green color in HSV
+        l_green = np.array([90, 20, 80])
+        u_green = np.array([105, 255, 250])
+        mask = cv2.inRange(hsv, l_green, u_green)
+
+        # Filter using contour area and remove small noise in mask for both,
+        # black and white
+        mask = denoise(mask, 255)
+        cv2.bitwise_not(mask)
+        mask = denoise(mask, 0)
+        cv2.bitwise_not(mask)
+
+        mask = cv2.blur(mask.astype(float), (3, 3))
+#        cv2.imshow('mask', mask)
+#        cv2.waitKey(5) & 0xFF
+        return mask.astype(float)/255
 
     def shift_image(self, img, dx, dy):
         img = np.roll(img, dy, axis=0)
@@ -163,9 +172,11 @@ class FakeCam:
         return img
 
     async def load_images(self):
+        print("\n\njap")
         async with self.image_lock:
             self.images: Dict[str, Any] = {}
-
+            print(self.background_image)
+            print("\n\njup")
             background = cv2.imread(self.background_image)
             if background is not None:
                 if not self.tiling:
@@ -202,6 +213,7 @@ class FakeCam:
                 background = next_frame()
 
             self.images["background"] = background
+            print("read background")
 
             if self.use_foreground and self.foreground_image is not None:
                 foreground = cv2.imread(self.foreground_image)
@@ -233,13 +245,13 @@ class FakeCam:
         return out
 
 
-    async def mask_frame(self, session, frame):
+    async def mask_frame(self, frame):
         # fetch the mask with retries (the app needs to warmup and we're lazy)
         # e v e n t u a l l y c o n s i s t e n t
         mask = None
         while mask is None:
             try:
-                mask = await self._get_mask(frame, session)
+                mask = await self._get_mask(frame)
             except Exception as e:
                 print(f"Mask request failed, retrying: {e}")
                 traceback.print_exc()
@@ -251,7 +263,7 @@ class FakeCam:
         async with self.image_lock:
             background = next(self.images["background"])
             for c in range(frame.shape[2]):
-                frame[:, :, c] = frame[:, :, c] * mask + background[:, :, c] * (1 - mask)
+                frame[:, :, c] = frame[:, :, c] * (1- mask) + background[:, :, c] * (mask)
 
             if self.use_foreground and self.foreground_image is not None:
                 for c in range(frame.shape[2]):
@@ -259,7 +271,6 @@ class FakeCam:
                         frame[:, :, c] * self.images["inverted_foreground_mask"]
                         + self.images["foreground"][:, :, c] * self.images["foreground_mask"]
                         )
-
         return frame
 
     def put_frame(self, frame):
@@ -267,34 +278,30 @@ class FakeCam:
 
     def stop(self):
         self.real_cam.stop()
-        if self.use_akvcam:
-            self.fake_cam.__del__()
 
     async def run(self):
         await self.load_images()
         self.real_cam.start()
-        if self.socket != "":
-            conn = aiohttp.UnixConnector(path=self.socket)
-        else:
-            conn = None
-        async with aiohttp.ClientSession(connector=conn) as session:
-            t0 = time.monotonic()
-            print_fps_period = 1
-            frame_count = 0
-            while True:
-                frame = self.real_cam.read()
-                if frame is None:
-                    await asyncio.sleep(0.1)
-                    continue
-                await self.mask_frame(session, frame)
-                self.put_frame(frame)
-                frame_count += 1
-                td = time.monotonic() - t0
-                if td > print_fps_period:
-                    self.current_fps = frame_count / td
-                    print("FPS: {:6.2f}".format(self.current_fps), end="\r")
-                    frame_count = 0
-                    t0 = time.monotonic()
+        t0 = time.monotonic()
+        print_fps_period = 1
+        frame_count = 0
+        while True:
+            frame = self.real_cam.read()
+            if frame is None:
+                await asyncio.sleep(0.1)
+                continue
+            await self.mask_frame(frame)
+            self.put_frame(frame)
+            frame_count += 1
+            curtime = time.monotonic()
+            td = curtime - t0
+            if td > print_fps_period:
+                cv2.imshow('frame',frame)
+                cv2.waitKey(5) & 0xFF
+                self.current_fps = frame_count / td
+                print("FPS: {:6.2f}".format(self.current_fps), end="\r")
+                frame_count = 0
+                t0 = curtime
 
 def parse_args():
     parser = ArgumentParser(description="Faking your webcam background under \
@@ -315,8 +322,6 @@ def parse_args():
                         help="Set real webcam path")
     parser.add_argument("-v", "--v4l2loopback-path", default="/dev/video2",
                         help="V4l2loopback device path")
-    parser.add_argument("--akvcam", action="store_true",
-                        help="Use an akvcam device rather than a v4l2loopback device")
     parser.add_argument("-i", "--image-folder", default=".",
                         help="Folder which contains foreground and background images")
     parser.add_argument("-b", "--background-image", default="background.*",
@@ -338,7 +343,7 @@ def parse_args():
 
 def sigint_handler(loop, cam, signal, frame):
     print("Reloading background / foreground images")
-    asyncio.ensure_future(cam.load_images())
+    await cam.load_images()
 
 
 def sigquit_handler(loop, cam, signal, frame):
@@ -363,8 +368,7 @@ def main():
         foreground_image=findFile(args.foreground_image, args.image_folder),
         foreground_mask_image=findFile(args.foreground_mask_image, args.image_folder),
         webcam_path=args.webcam_path,
-        v4l2loopback_path=args.v4l2loopback_path,
-        use_akvcam=args.akvcam)
+        v4l2loopback_path=args.v4l2loopback_path)
     loop = asyncio.get_event_loop()
     signal.signal(signal.SIGINT, partial(sigint_handler, loop, cam))
     signal.signal(signal.SIGQUIT, partial(sigquit_handler, loop, cam))
