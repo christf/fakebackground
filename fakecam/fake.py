@@ -20,6 +20,7 @@ import fnmatch
 import time
 import threading
 
+
 def findFile(pattern, path):
     for root, _, files in os.walk(path):
         for name in files:
@@ -125,8 +126,9 @@ class FakeCam:
         self.image_lock = threading.Lock()
 
 
+    
 
-    async def _get_mask(self, frame):
+    async def _get_mask(self, frame, l_green, u_green):
         def denoise(mask, val):
             thresh = cv2.threshold(mask, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
             cnts = cv2.findContours(thresh, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
@@ -134,30 +136,87 @@ class FakeCam:
             applymorphology = False
             for c in cnts:
                 area = cv2.contourArea(c)
-                if area < 5000:
+                if area < 2500:
                     applymorphology = True
                     cv2.drawContours(thresh, [c], -1, (val,val,val), -1)
                     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
                                                        (20,20))
             return cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel,
                                                       iterations=1) if applymorphology else mask
-        hsv = cv2.cvtColor(frame, cv2.COLOR_RGB2HSV)
-        # define range of green color in HSV
-        l_green = np.array([37, 20, 80])
-        u_green = np.array([50, 255, 250])
-        mask = cv2.inRange(hsv, l_green, u_green)
+        def calculate_mask(frame, l_green, u_green, results, index):
+            hsv = cv2.cvtColor(frame, cv2.COLOR_RGB2HSV)
+            mask = cv2.inRange(hsv, l_green, u_green)
 
-        # Filter using contour area and remove small noise in mask for both,
-        # black and white
-        mask = denoise(mask, 255)
-        cv2.bitwise_not(mask)
-        mask = denoise(mask, 0)
-        cv2.bitwise_not(mask)
+            # remove small noise in mask
+            mask = denoise(mask, 255)
+            cv2.bitwise_not(mask)
+            mask = denoise(mask, 0)
+            cv2.bitwise_not(mask)
+            mask = cv2.blur(mask, (5, 5))
+            results[index] = mask.astype(float)/255
 
-        mask = cv2.blur(mask.astype(float), (3, 3))
-#        cv2.imshow('mask', mask)
-#        cv2.waitKey(5) & 0xFF
-        return mask.astype(float)/255
+        def split_image(img, chunks):
+            results = [None] * (chunks * chunks)
+            if chunks > 1:
+                sizeX = img.shape[1]
+                sizeY = img.shape[0]
+                nRows = chunks 
+                mCols = chunks
+                for i in range(0,nRows):
+                    for j in range(0, mCols):
+                        index = j + (chunks * i)
+                        results[index] = img[i*int(sizeY/nRows):i*int(sizeY/nRows)
+                                            + int(sizeY/nRows)
+                                ,j*int(sizeX/mCols):j*int(sizeX/mCols) + int(sizeX/mCols)]
+            else:
+                results[0] = img
+            return results
+
+        def merge_image(imgs, chunks):
+            if chunks > 1:
+                image_shape = (imgs[0].shape[1], imgs[0].shape[0])
+                montage_shape = (chunks, chunks)
+                montage_image = np.zeros((image_shape[1] * montage_shape[1], image_shape[0] * montage_shape[0]))
+                cursor_pos = [0, 0]
+                for img in imgs:
+                    montage_image[cursor_pos[1]:cursor_pos[1] + image_shape[1], cursor_pos[0]:cursor_pos[0] + image_shape[0]] = img
+                    cursor_pos[0] += image_shape[0]  # increment cursor x position
+                    if cursor_pos[0] >= montage_shape[0] * image_shape[0]:
+                        cursor_pos[1] += image_shape[1]  # increment cursor y position
+                        cursor_pos[0] = 0
+                return montage_image
+            else:
+                return imgs[0]
+
+
+
+
+        def process_image(img, chunks):
+            # Dimensions of the image
+            threads = [None] * (chunks * chunks)
+            results = [None] * (chunks * chunks)
+
+            index = 0
+            if chunks > 1:
+                for i in split_image(img, chunks):
+                    threads[index] = threading.Thread(target=calculate_mask,
+                                                        args=(i,
+                                                                l_green,
+                                                                u_green,
+                                                                results,
+                                                                index))
+                    threads[index].start()
+                    index+=1
+
+                for t in threads:
+                    t.join()
+            else:
+                calculate_mask(img, l_green, u_green, results, 0)
+
+
+            return merge_image(results, chunks) 
+        return process_image(frame, 2)
+
 
     def shift_image(self, img, dx, dy):
         img = np.roll(img, dy, axis=0)
@@ -259,7 +318,9 @@ class FakeCam:
         mask = None
         while mask is None:
             try:
-                mask = await self._get_mask(frame)
+                l_green = np.array([85, 20, 80])
+                u_green = np.array([100, 255, 250])
+                mask = await self._get_mask(frame, l_green, u_green)
             except Exception as e:
                 print(f"Mask request failed, retrying: {e}")
                 traceback.print_exc()
@@ -306,9 +367,9 @@ class FakeCam:
             frame_count += 1
             curtime = time.monotonic()
             td = curtime - t0
+#            cv2.imshow('frame',frame)
+#            cv2.waitKey(5) & 0xFF
             if td > print_fps_period:
-                cv2.imshow('frame',frame)
-                cv2.waitKey(5) & 0xFF
                 self.current_fps = frame_count / td
                 print("FPS: {:6.2f}".format(self.current_fps), end="\r")
                 frame_count = 0
