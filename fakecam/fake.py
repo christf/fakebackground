@@ -24,6 +24,7 @@ def findFile(pattern, path):
     for root, _, files in os.walk(path):
         for name in files:
             if fnmatch.fnmatch(name, pattern):
+                print("match: ", os.path.join(root, name))
                 return os.path.join(root, name)
     return None
 
@@ -83,31 +84,31 @@ class FakeCam:
         fps: int,
         width: int,
         height: int,
-        scale_factor: float,
         use_foreground: bool,
         hologram: bool,
         tiling: bool,
         bodypix_url: str,
         socket: str,
-        background_image: str,
-        foreground_image: str,
-        foreground_mask_image: str,
+        fg_pattern: str,
+        bg_pattern: str,
+        image_folder: str,
+        fg_mask_pattern: str,
         webcam_path: str,
         v4l2loopback_path: str,
     ) -> None:
         self.use_foreground = use_foreground
         self.hologram = hologram
         self.tiling = tiling
-        self.background_image = background_image
-        self.foreground_image = foreground_image
-        self.foreground_mask_image = foreground_mask_image
-        self.scale_factor = scale_factor
         self.real_cam = RealCam(webcam_path, width, height, fps)
         # In case the real webcam does not support the requested mode.
         self.width = self.real_cam.get_frame_width()
         self.height = self.real_cam.get_frame_height()
         self.fake_cam = pyfakewebcam.FakeWebcam(v4l2loopback_path, self.width, self.height)
         self.foreground_mask = None
+        self.bg_pattern = bg_pattern
+        self.fg_pattern = fg_pattern
+        self.image_folder = image_folder
+        self.fg_mask_pattern = fg_mask_pattern
         self.inverted_foreground_mask = None
         self.session = requests.Session()
         if bodypix_url.startswith('/'):
@@ -121,7 +122,7 @@ class FakeCam:
             self.socket = ""
             # self.session = requests.Session()
         self.images: Dict[str, Any] = {}
-        self.image_lock = asyncio.Lock()
+        self.image_lock = threading.Lock()
 
 
 
@@ -142,8 +143,8 @@ class FakeCam:
                                                       iterations=1) if applymorphology else mask
         hsv = cv2.cvtColor(frame, cv2.COLOR_RGB2HSV)
         # define range of green color in HSV
-        l_green = np.array([90, 20, 80])
-        u_green = np.array([105, 255, 250])
+        l_green = np.array([37, 20, 80])
+        u_green = np.array([50, 255, 250])
         mask = cv2.inRange(hsv, l_green, u_green)
 
         # Filter using contour area and remove small noise in mask for both,
@@ -171,12 +172,17 @@ class FakeCam:
             img[:, dx:] = 0
         return img
 
-    async def load_images(self):
-        print("\n\njap")
-        async with self.image_lock:
+    def load_images(self):
+        print("acquiring lock")
+        self.image_lock.acquire()
+        print("lock acquired")
+        try:
+            self.background_image=findFile(self.bg_pattern, self.image_folder)
+            self.foreground_image=findFile(self.fg_pattern, self.image_folder)
+            self.foreground_mask_image=findFile(self.fg_mask_pattern, self.image_folder)
             self.images: Dict[str, Any] = {}
-            print(self.background_image)
-            print("\n\njup")
+            print("background image to be loaded: ", self.background_image)
+            print("foreground image to be loaded: ", self.foreground_image)
             background = cv2.imread(self.background_image)
             if background is not None:
                 if not self.tiling:
@@ -213,21 +219,23 @@ class FakeCam:
                 background = next_frame()
 
             self.images["background"] = background
-            print("read background")
 
             if self.use_foreground and self.foreground_image is not None:
                 foreground = cv2.imread(self.foreground_image)
                 self.images["foreground"] = cv2.resize(foreground,
-                                                       (self.width, self.height))
+                                                        (self.width, self.height))
                 foreground_mask = cv2.imread(self.foreground_mask_image)
                 foreground_mask = cv2.normalize(
                     foreground_mask, None, alpha=0, beta=1,
                     norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_32F)
                 foreground_mask = cv2.resize(foreground_mask,
-                                             (self.width, self.height))
+                                                (self.width, self.height))
                 self.images["foreground_mask"] = cv2.cvtColor(
                     foreground_mask, cv2.COLOR_BGR2GRAY)
                 self.images["inverted_foreground_mask"] = 1 - self.images["foreground_mask"]
+        finally:
+            self.image_lock.release()
+            print("lock released")
 
     def hologram_effect(self, img):
         # add a blue tint
@@ -260,7 +268,8 @@ class FakeCam:
             frame = self.hologram_effect(frame)
 
         # composite the foreground and background
-        async with self.image_lock:
+        self.image_lock.acquire()
+        try:
             background = next(self.images["background"])
             for c in range(frame.shape[2]):
                 frame[:, :, c] = frame[:, :, c] * (1- mask) + background[:, :, c] * (mask)
@@ -271,6 +280,8 @@ class FakeCam:
                         frame[:, :, c] * self.images["inverted_foreground_mask"]
                         + self.images["foreground"][:, :, c] * self.images["foreground_mask"]
                         )
+        finally:
+            self.image_lock.release()
         return frame
 
     def put_frame(self, frame):
@@ -280,7 +291,7 @@ class FakeCam:
         self.real_cam.stop()
 
     async def run(self):
-        await self.load_images()
+        self.load_images()
         self.real_cam.start()
         t0 = time.monotonic()
         print_fps_period = 1
@@ -314,8 +325,6 @@ def parse_args():
                         help="Set real webcam height")
     parser.add_argument("-F", "--fps", default=30, type=int,
                         help="Set real webcam FPS")
-    parser.add_argument("-S", "--scale-factor", default=0.5, type=float,
-                        help="Scale factor of the image sent to BodyPix network")
     parser.add_argument("-B", "--bodypix-url", default="http://127.0.0.1:9000",
                         help="Tensorflow BodyPix URL")
     parser.add_argument("-w", "--webcam-path", default="/dev/video0",
@@ -342,8 +351,11 @@ def parse_args():
 
 
 def sigint_handler(loop, cam, signal, frame):
-    print("Reloading background / foreground images")
-    await cam.load_images()
+    if not cam.image_lock.locked():
+        print("Reloading background / foreground images")
+        cam.load_images()
+    else:
+        print("Unable to acquire lock. Please try again to reload scenery")
 
 
 def sigquit_handler(loop, cam, signal, frame):
@@ -358,15 +370,15 @@ def main():
         fps=args.fps,
         width=args.width,
         height=args.height,
-        scale_factor=args.scale_factor,
         use_foreground=not args.no_foreground,
         hologram=args.hologram,
         tiling=args.tile_background,
         bodypix_url=args.bodypix_url,
         socket="",
-        background_image=findFile(args.background_image, args.image_folder),
-        foreground_image=findFile(args.foreground_image, args.image_folder),
-        foreground_mask_image=findFile(args.foreground_mask_image, args.image_folder),
+        image_folder=args.image_folder,
+        fg_pattern=args.foreground_image,
+        bg_pattern=args.background_image,
+        fg_mask_pattern=args.foreground_mask_image,
         webcam_path=args.webcam_path,
         v4l2loopback_path=args.v4l2loopback_path)
     loop = asyncio.get_event_loop()
