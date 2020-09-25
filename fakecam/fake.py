@@ -136,7 +136,7 @@ class FakeCam:
             applymorphology = False
             for c in cnts:
                 area = cv2.contourArea(c)
-                if area < 2500:
+                if area < 500:
                     applymorphology = True
                     cv2.drawContours(thresh, [c], -1, (val,val,val), -1)
                     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
@@ -149,9 +149,7 @@ class FakeCam:
 
             # remove small noise in mask
             mask = denoise(mask, 255)
-            cv2.bitwise_not(mask)
             mask = denoise(mask, 0)
-            cv2.bitwise_not(mask)
             mask = cv2.blur(mask, (5, 5))
             results[index] = mask.astype(float)/255
 
