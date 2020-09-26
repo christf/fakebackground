@@ -78,7 +78,6 @@ class RealCam:
         self.stopped = True
         self.thread.join()
 
-
 class FakeCam:
     def __init__(
         self,
@@ -112,6 +111,13 @@ class FakeCam:
         self.fg_mask_pattern = fg_mask_pattern
         self.inverted_foreground_mask = None
         self.session = requests.Session()
+        self.chunks = 2
+        self.results = [None] * (self.chunks * self.chunks)
+        self.oldmask = [None] * self.chunks * self.chunks
+        self.mask_smoothen_frames = 3
+        for i in range(0, self.chunks * self.chunks):
+            self.oldmask[i] =  np.zeros(((int)(self.height / self.chunks), (int)(self.width / self.chunks)))
+
         if bodypix_url.startswith('/'):
             print("Looks like you want to use a unix socket")
             # self.session = requests_unixsocket.Session()
@@ -136,13 +142,17 @@ class FakeCam:
             applymorphology = False
             for c in cnts:
                 area = cv2.contourArea(c)
-                if area < 500:
+                if area < 1000:
                     applymorphology = True
                     cv2.drawContours(thresh, [c], -1, (val,val,val), -1)
                     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
                                                        (20,20))
             return cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel,
                                                       iterations=1) if applymorphology else mask
+
+        def sliding_average(old, new, n):
+            return old * (n-1)/n + new/n
+
         def calculate_mask(frame, l_green, u_green, results, index):
             hsv = cv2.cvtColor(frame, cv2.COLOR_RGB2HSV)
             mask = cv2.inRange(hsv, l_green, u_green)
@@ -151,18 +161,21 @@ class FakeCam:
             mask = denoise(mask, 255)
             mask = denoise(mask, 0)
             mask = cv2.blur(mask, (5, 5))
-            results[index] = mask.astype(float)/255
 
-        def split_image(img, chunks):
-            results = [None] * (chunks * chunks)
-            if chunks > 1:
+            sa =  sliding_average(self.oldmask[index], mask, self.mask_smoothen_frames)
+            self.oldmask[index] = sa
+            results[index] = sa.astype(float)/255
+
+        def split_image(img):
+            results = [None] * (self.chunks * self.chunks)
+            if self.chunks > 1:
                 sizeX = img.shape[1]
                 sizeY = img.shape[0]
-                nRows = chunks 
-                mCols = chunks
+                nRows = self.chunks 
+                mCols = self.chunks
                 for i in range(0,nRows):
                     for j in range(0, mCols):
-                        index = j + (chunks * i)
+                        index = j + (self.chunks * i)
                         results[index] = img[i*int(sizeY/nRows):i*int(sizeY/nRows)
                                             + int(sizeY/nRows)
                                 ,j*int(sizeX/mCols):j*int(sizeX/mCols) + int(sizeX/mCols)]
@@ -170,10 +183,10 @@ class FakeCam:
                 results[0] = img
             return results
 
-        def merge_image(imgs, chunks):
-            if chunks > 1:
+        def merge_image(imgs):
+            if self.chunks > 1:
                 image_shape = (imgs[0].shape[1], imgs[0].shape[0])
-                montage_shape = (chunks, chunks)
+                montage_shape = (self.chunks, self.chunks)
                 montage_image = np.zeros((image_shape[1] * montage_shape[1], image_shape[0] * montage_shape[0]))
                 cursor_pos = [0, 0]
                 for img in imgs:
@@ -189,19 +202,18 @@ class FakeCam:
 
 
 
-        def process_image(img, chunks):
+        def process_image(img):
             # Dimensions of the image
-            threads = [None] * (chunks * chunks)
-            results = [None] * (chunks * chunks)
+            threads = [None] * (self.chunks * self.chunks)
 
             index = 0
-            if chunks > 1:
-                for i in split_image(img, chunks):
+            if self.chunks > 1:
+                for i in split_image(img):
                     threads[index] = threading.Thread(target=calculate_mask,
                                                         args=(i,
                                                                 l_green,
                                                                 u_green,
-                                                                results,
+                                                                self.results,
                                                                 index))
                     threads[index].start()
                     index+=1
@@ -209,25 +221,19 @@ class FakeCam:
                 for t in threads:
                     t.join()
             else:
-                calculate_mask(img, l_green, u_green, results, 0)
+                calculate_mask(img, l_green, u_green, self.results, 0)
 
 
-            return merge_image(results, chunks) 
-        return process_image(frame, 2)
-
-
-    def shift_image(self, img, dx, dy):
-        img = np.roll(img, dy, axis=0)
-        img = np.roll(img, dx, axis=1)
-        if dy > 0:
-            img[:dy, :] = 0
-        elif dy < 0:
-            img[dy:, :] = 0
-        if dx > 0:
-            img[:, :dx] = 0
-        elif dx < 0:
-            img[:, dx:] = 0
-        return img
+            return merge_image(self.results) 
+        
+        new = process_image(frame)
+        # sa =  sliding_average(mask, new, self.mask_smoothen_frames)
+#        cv2.imshow('old',mask)
+#        cv2.imshow('new',new)
+#        cv2.imshow('frame',frame)
+#        cv2.imshow('sa', sa)
+#        cv2.waitKey(5) & 0xFF
+        return new
 
     def load_images(self):
         print("acquiring lock")
@@ -294,44 +300,25 @@ class FakeCam:
             self.image_lock.release()
             print("lock released")
 
-    def hologram_effect(self, img):
-        # add a blue tint
-        holo = cv2.applyColorMap(img, cv2.COLORMAP_WINTER)
-        # add a halftone effect
-        bandLength, bandGap = 2, 3
-        for y in range(holo.shape[0]):
-            if y % (bandLength+bandGap) < bandLength:
-                holo[y,:,:] = holo[y,:,:] * np.random.uniform(0.1, 0.3)
-        # add some ghosting
-        holo_blur = cv2.addWeighted(holo, 0.2, self.shift_image(holo.copy(), 5, 5), 0.8, 0)
-        holo_blur = cv2.addWeighted(holo_blur, 0.4, self.shift_image(holo.copy(), -5, -5), 0.6, 0)
-        # combine with the original color, oversaturated
-        out = cv2.addWeighted(img, 0.5, holo_blur, 0.6, 0)
-        return out
-
-
     async def mask_frame(self, frame):
         # fetch the mask with retries (the app needs to warmup and we're lazy)
         # e v e n t u a l l y c o n s i s t e n t
-        mask = None
-        while mask is None:
+        l_green = np.array([85, 20, 80])
+        u_green = np.array([107, 255, 250])
+        new_mask = None
+        while new_mask is None:
             try:
-                l_green = np.array([85, 20, 80])
-                u_green = np.array([100, 255, 250])
-                mask = await self._get_mask(frame, l_green, u_green)
+                new_mask = await self._get_mask(frame, l_green, u_green)
             except Exception as e:
                 print(f"Mask request failed, retrying: {e}")
                 traceback.print_exc()
-
-        if self.hologram:
-            frame = self.hologram_effect(frame)
-
+        
         # composite the foreground and background
         self.image_lock.acquire()
         try:
             background = next(self.images["background"])
             for c in range(frame.shape[2]):
-                frame[:, :, c] = frame[:, :, c] * (1- mask) + background[:, :, c] * (mask)
+                frame[:, :, c] = frame[:, :, c] * (1- new_mask) + background[:, :, c] * (new_mask)
 
             if self.use_foreground and self.foreground_image is not None:
                 for c in range(frame.shape[2]):
@@ -365,8 +352,6 @@ class FakeCam:
             frame_count += 1
             curtime = time.monotonic()
             td = curtime - t0
-#            cv2.imshow('frame',frame)
-#            cv2.waitKey(5) & 0xFF
             if td > print_fps_period:
                 self.current_fps = frame_count / td
                 print("FPS: {:6.2f}".format(self.current_fps), end="\r")
