@@ -303,8 +303,8 @@ class FakeCam:
     async def mask_frame(self, frame):
         # fetch the mask with retries (the app needs to warmup and we're lazy)
         # e v e n t u a l l y c o n s i s t e n t
-        l_green = np.array([85, 20, 80])
-        u_green = np.array([107, 255, 250])
+        l_green = np.array([90, 20, 80])
+        u_green = np.array([103, 255, 250])
         new_mask = None
         while new_mask is None:
             try:
